@@ -11,14 +11,16 @@ import os
 # BE ABSOLUTELY SURE THAT YOU'RE USING:
 # GPIO 3: LED
 # GPIO 4: Button
+# Otherwise shit will probably explode or something idfk.
 LED = 3
 BUTTON = 4
 
-# Use GPIO numbers and not pin numbers.
+# Use GPIO numbers and not pin numbers because they're different for some
+# fucking reason.
 gpio.setmode(gpio.BCM)
 
-# Use a pulldown resistor on the button because otherwise it won't get the data
-# properly. No idea why not. :/
+# We need to use a pulldown resistor on the button because electronics is
+# bullshit.
 gpio.setup(BUTTON, gpio.IN, gpio.PUD_DOWN)
 gpio.setup(LED, gpio.OUT)
 
