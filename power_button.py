@@ -35,51 +35,133 @@ def cleanup(sig, stack_frame):
 for sig in [signal.SIGTERM, signal.SIGINT]:
     signal.signal(sig, cleanup)
 
-# Used to interact with the blink() thread.
-# Set to None to keep a solid LED.
-blink_delay = None
+class Blinker(object):
+    # How often should we check for self.solid to stop being False? Only
+    # applies if it's true. In milliseconds.
+    SOLID_CHECK_FREQ = 500
 
-def blink(pin, stop_event):
-    new_pin_state = False
+    def __init__(self, pin, interrupt=None):
+        """ Blinks an LED in its own thread.
 
-    event_timeout = blink_delay or 0.5
+        pin: The pin number of the LED.
 
-    while True:
-        # TODO: Use events to tell this thread if blink_delay was changed.
-        event_timeout = blink_delay or 0.5
+        interrupt: An event that tells the blinker class to stop its sleep to
+            handle something. Either exit the program or change blinking
+            patterns.
+        """
+        self.pin = pin
 
-        if stop_event.wait(timeout=event_timeout):
-            return
+        self.interrupt = interrupt or threading.Event()
 
-        if blink_delay is None:
-            new_pin_state = True
+        # If interrupt is set and so is this, we know we're supposed to kill
+        # the thread.
+        self.kill_thread = False
+
+        self.blink_thread = threading.Thread(daemon=True, target=self.blink)
+
+    def set_led(self, value):
+        """ This is here so you can monkey-patch it for debugging. """
+        gpio.output(self.pin, value)
+
+    def get_led(self):
+        """ Ditto. """
+        return gpio.input(self.pin)
+
+    def set_pattern(self, blink_delay=None):
+        """ Set the blinking pattern.
+
+        blink_delay: Wait this many milliseconds between blinks. If this is
+            None, keep the light solid instead of blinking it.
+        """
+        if blink_delay == None:
+            self.solid = True
+            self.blink_delay = self.SOLID_CHECK_FREQ
         else:
-            new_pin_state = not gpio.input(pin)
+            self.solid = False
+            self.blink_delay = blink_delay
 
-        gpio.output(pin, new_pin_state)
+        self.interrupt.set()
 
-stop_blinking = threading.Event()
+    def start_blinking(self, *args, **kwargs):
+        """ Start a thread that'll blink the LED for you.
 
-# blinker is a daemon so it won't keep the program alive after a kill signal or
-# KeyboardInterrupt.
-blinker = threading.Thread(daemon=True, target=(lambda: blink(LED, stop_blinking)))
-blinker.start()
+        See set_pattern for arg info.
+        """
+        self.set_pattern(*args, **kwargs)
+        self.blink_thread.start()
 
-while True:
-    # This stops signals like KeyboardInterrupt from working when it blocks.
+    def stop_blinking(self):
+        """ Signal blink_thread to stop. Blocks until it's done. """
+        self.kill_thread = True
+        self.interrupt.set()
+        self.blink_thread.join()
 
-    while gpio.wait_for_edge(BUTTON, gpio.RISING, timeout=500) is None:
-        pass
+    def blink(self):
+        while True:
+            if self.interrupt.wait(self.blink_delay):
+                self.interrupt.clear()
 
-    blink_delay = 0.2
-    time.sleep(1)
+                if self.kill_thread:
+                    self.kill_thread = False
+                    self.set_led(gpio.LOW)
+                    return
 
-    # Wait for 500 ms 10 times for a total of 5 seconds.
-    for _ in range(10):
-        if gpio.wait_for_edge(BUTTON, gpio.RISING, timeout=500) is not None:
-            stop_blinking.set()
-            blinker.join()
+            if self.solid:
+                self.set_led(gpio.HIGH)
+            else:
+                self.set_led(not self.get_led())
+
+class ButtonHandler(object):
+    # The blinking patterns to use in safe and unsafe mode.
+    # See Blinker.set_pattern
+    SAFE_BLINK = None
+    UNSAFE_BLINK = 500
+
+    def __init__(self, button_pin):
+        self.button_pin = button_pin
+        self.blinker = Blinker(self.button_pin)
+        self.blinker.start_blinking()
+
+        # The power switch has two modes: In safe mode, the LED is solid and
+        # everything is good. A press of the button brings us to unsafe mode.
+        # In unsafe mode, the LED blinks and a button press will power off the
+        # system. Basically, the second button press is like an "are you sure"?
+        self._safe_mode = True
+
+    def start_monitoring(self):
+        gpio.add_event_detect(self.button_pin, gpio.RISING, self.handle_button)
+
+    def stop_monitoring(self):
+        """ CAUTION: This removes all listeners on the button_pin. """
+        gpio.remove_event_detect(self.button_pin)
+
+    @property
+    def safe_mode(self):
+        return self._safe_mode
+
+    @safe_mode.setter
+    def safe_mode(self, value):
+        value = bool(value)
+
+        if self._safe_mode != value:
+            self._safe_mode = value
+            self.blinker.set_pattern(
+                self.SAFE_BLINK if self.safe_mode else self.UNSAFE_BLINK)
+
+    def handle_button(self):
+        if not self.safe_mode:
+            self.blinker.stop_blinking()
             os.system("poweroff")
             exit(0)
+        else:
+            def threaded_stuff():
+                self.safe_mode = False
+                time.sleep(5)
+                self.safe_mode = True
+            threading.Thread(daemon=True, target=threaded_stuff).start()
 
-    blink_delay = None
+bh = ButtonHandler()
+bh.start_monitoring()
+
+while True:
+    input()
